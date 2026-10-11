@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Serper API CLI with multi-key failover.
+
+Usage:
+    serper-search "query" [--num 10] [--endpoint search|news|images|videos|places|scholar|autocomplete]
+    serper-search --endpoint scrape --url "https://example.com/page"
+
+Prints JSON to stdout (array of results, or object for scrape).
+Auth: tries each connector in ~/workspace/skills/serper/connectors.txt in
+order (starting from the last-known-good one). On quota/rate-limit/auth
+errors (400/401/402/403/429) or a missing connector, it silently moves to
+the next key. A search only fails when every configured key is exhausted.
+
+Add more keys: credentials.request_api_access with provider "serper2",
+"serper3", ... (same api_hosts + placement), then append "custom.serper2"
+etc. to connectors.txt, one per line.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+def read_json_response(resp):
+    import json
+    return json.loads(resp.read().decode())
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONNECTORS_FILE = os.path.join(SKILL_DIR, "connectors.txt")
+STATE_FILE = os.path.join(SKILL_DIR, ".last_good")
+ALLOWED_HOSTS = ["google.serper.dev", "scrape.serper.dev"]
+ENDPOINTS = {
+    "search": "https://google.serper.dev/search",
+    "news": "https://google.serper.dev/news",
+    "images": "https://google.serper.dev/images",
+    "videos": "https://google.serper.dev/videos",
+    "places": "https://google.serper.dev/places",
+    "scholar": "https://google.serper.dev/scholar",
+    "autocomplete": "https://google.serper.dev/autocomplete",
+    "scrape": "https://scrape.serper.dev",
+}
+# HTTP statuses that mean "this key is unusable right now, try the next one".
+FAILOVER_STATUSES = {400, 401, 402, 403, 429}
+
+
+def load_connectors():
+    # 优先环境变量 SERPER_API_KEY（逗号分隔多 key），其次 connectors.txt
+    env_keys = os.environ.get("SERPER_API_KEY", "")
+    keys = [k.strip() for k in env_keys.split(",") if k.strip()]
+    if keys:
+        return keys
+    try:
+        with open(CONNECTORS_FILE) as f:
+            names = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except OSError:
+        names = []
+    return names
+
+
+def ordered_connectors(names):
+    """Start from the last-known-good connector, then the rest in file order."""
+    try:
+        with open(STATE_FILE) as f:
+            last = f.read().strip()
+    except OSError:
+        last = ""
+    if last in names:
+        i = names.index(last)
+        return names[i:] + names[:i]
+    return list(names)
+
+
+def remember_good(name):
+    try:
+        with open(STATE_FILE, "w") as f:
+            f.write(name)
+    except OSError:
+        pass
+
+
+def _post(connector, url, payload):
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    req.add_header("X-API-KEY", connector)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return read_json_response(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code in FAILOVER_STATUSES or 500 <= exc.code < 600:
+            raise _Failover(f"HTTP {exc.code} on {connector}")
+        raise
+
+
+def normalize(endpoint, data):
+    """Normalize each endpoint's response to a JSON-serializable structure."""
+    if endpoint in ("search", "scholar"):
+        return [
+            {
+                "title": it.get("title", ""),
+                "url": it.get("link", ""),
+                "snippet": it.get("snippet", ""),
+            }
+            for it in data.get("organic", [])
+            if it.get("link")
+        ]
+    if endpoint == "news":
+        return [
+            {
+                "title": it.get("title", ""),
+                "url": it.get("link", ""),
+                "snippet": it.get("snippet", ""),
+                "date": it.get("date", ""),
+                "source": it.get("source", ""),
+            }
+            for it in data.get("news", [])
+            if it.get("link")
+        ]
+    if endpoint == "images":
+        return [
+            {
+                "title": it.get("title", ""),
+                "image_url": it.get("imageUrl", ""),
+                "page_url": it.get("link", ""),
+                "thumbnail": it.get("thumbnailUrl", ""),
+            }
+            for it in data.get("images", [])
+            if it.get("imageUrl")
+        ]
+    if endpoint == "videos":
+        return [
+            {
+                "title": it.get("title", ""),
+                "url": it.get("link", ""),
+                "thumbnail": it.get("imageUrl", ""),
+                "duration": it.get("duration", ""),
+            }
+            for it in data.get("videos", [])
+            if it.get("link")
+        ]
+    if endpoint == "places":
+        places = data.get("places") or ([data.get("place")] if data.get("place") else [])
+        return [
+            {
+                "title": p.get("title", ""),
+                "address": p.get("address", ""),
+                "rating": p.get("rating"),
+                "phone": p.get("phoneNumber", ""),
+                "website": p.get("website", ""),
+            }
+            for p in places
+            if p
+        ]
+    if endpoint == "autocomplete":
+        return data.get("suggestions", [])
+    if endpoint == "scrape":
+        return {
+            "url": data.get("url", ""),
+            "title": (data.get("metadata") or {}).get("title", ""),
+            "text": (data.get("text") or "")[:8000],
+        }
+    return data
+
+
+class _Failover(Exception):
+    pass
+
+
+def call_once(connector, endpoint, query, url, num):
+    if endpoint == "scrape":
+        payload = {"url": url}
+    else:
+        payload = {"q": query, "num": num}
+    data = _post(connector, ENDPOINTS[endpoint], payload)
+    return normalize(endpoint, data)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("query", nargs="?", default="")
+    ap.add_argument("--num", type=int, default=10)
+    ap.add_argument("--endpoint", choices=ENDPOINTS, default="search")
+    ap.add_argument("--url", default="",
+                    help="Target URL for --endpoint scrape")
+    args = ap.parse_args()
+    num = max(1, min(args.num, 100))
+
+    if args.endpoint == "scrape" and not args.url:
+        ap.error("--endpoint scrape requires --url")
+    if args.endpoint != "scrape" and not args.query:
+        ap.error("query is required for this endpoint")
+
+    connectors = ordered_connectors(load_connectors())
+    errors = []
+    for name in connectors:
+        try:
+            results = call_once(name, args.endpoint, args.query, args.url, num)
+        except (DynamicCredentialError, _Failover, OSError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        remember_good(name)
+        print(json.dumps(results, ensure_ascii=False, indent=1))
+        return 0
+
+    print(
+        json.dumps(
+            {"error": "all serper keys exhausted or unavailable", "details": errors}
+        ),
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
