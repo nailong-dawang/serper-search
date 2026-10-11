@@ -1,0 +1,7 @@
+# One connector id per line, tried in order (starting from last-known-good).
+# Add more via: credentials.request_api_access(provider="serper2", api_hosts=["google.serper.dev"],
+#   auth_scheme="api_key", placement="custom_header:X-API-KEY"), then append "custom.serper2" here.
+custom.serper
+custom.serper2
+custom.serper3
+custom.serper4
